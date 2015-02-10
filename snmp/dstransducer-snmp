@@ -1,0 +1,346 @@
+#! /usr/bin/perl
+# --------------------------------------------------------------------
+# Copyright (C) 2007-2015 Oliver Hitz <oliver@net-track.ch>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place - Suite 330, Boston,
+# MA 02111-1307, USA.
+# --------------------------------------------------------------------
+# dstransducer-snmp
+#
+# An extension for making transducer values available via SNMP.
+# --------------------------------------------------------------------
+
+use threads;
+use threads::shared;
+
+use strict;
+
+# The base OID of this extension. Has to match the OID in snmpd.conf:
+my $baseoid = ".1.3.6.1.4.1.21695.1.5";
+
+# Results are cached for some seconds to speed up SNMP walks.
+my $cache_secs = 60;
+
+# --------------------------------------------------------------------
+
+my $the_mib;
+my $the_mib_locks;
+my $the_mib_index;
+
+# Load configuration file
+my $conf = read_configuration($ARGV[0]);
+
+# Switch on autoflush
+$| = 1;
+
+# Start MIB reading thread
+prepare_mib();
+
+my $mib_thread = threads->create(\&populate_mib);
+
+# Main loop
+while (my $cmd = <STDIN>) {
+  chomp $cmd;
+
+  if ($cmd eq "PING") {
+    print "PONG\n";
+  } elsif ($cmd eq "get") {
+    my $oid_in = <STDIN>;
+
+    my $oid = get_oid($oid_in);
+
+    if ($oid != 0 && defined($the_mib->{$oid})) {
+      lock $the_mib_locks->[$the_mib->{$oid}[3]];
+
+      print "$baseoid.$oid\n";
+      print $the_mib->{$oid}[0]."\n";
+      print $the_mib->{$oid}[1]."\n";
+    } else {
+      print "NONE\n";
+    }
+  } elsif ($cmd eq "getnext") {
+    my $oid_in = <STDIN>;
+
+    my $oid = get_oid($oid_in);
+    my $found = 0;
+    my $found_index;
+
+    if ($oid != 0 && defined($the_mib->{$oid})) {
+      $found_index = $the_mib->{$oid}[2];
+      $found_index++;
+      if (defined $the_mib_index->[$found_index]) {
+	$found = 1;
+      }
+    } else {
+      # Find the first OID that appears after the desired one. Slow!
+      for (my $i = 0; $i < @{ $the_mib_index }; $i++) {
+	if (oidcmp($oid, $the_mib_index->[$i]) == -1) {
+	  $found_index = $i;
+	  $found = 1;
+	  last;
+	}
+      }
+    }
+
+    if ($found) {
+      my $lock_index = $the_mib->{$the_mib_index->[$found_index]}[3];
+
+      lock $the_mib_locks->[$lock_index];
+
+      print "$baseoid.".$the_mib_index->[$found_index]."\n";
+      print $the_mib->{$the_mib_index->[$found_index]}[0]."\n";
+      print $the_mib->{$the_mib_index->[$found_index]}[1]."\n";
+    } else {
+     print "NONE\n";
+    }
+  } else {
+    # Unknown command
+  }
+}
+
+exit 0;
+
+# --------------------------------------------------------------------
+# Return an OID, strip off the base OID.
+#
+sub get_oid
+{
+  my ($oid) = @_;
+  chomp $oid;
+
+  my $base = $baseoid;
+  $base =~ s/\./\\./g;
+
+  if ($oid !~ /^$base(\.|$)/) {
+    # Requested oid doesn't match base oid
+    return 0;
+  }
+
+  $oid =~ s/^$base\.?//;
+  return $oid;
+}
+
+# --------------------------------------------------------------------
+# Compare two OID's.
+#
+sub oidcmp {
+  my ($x, $y) = @_;
+
+  my @a = split /\./, $x;
+  my @b = split /\./, $y;
+
+  my $i = 0;
+
+  while (1) {
+
+    if ($i > $#a) {
+      if ($i > $#b) {
+	return 0;
+      } else {
+	return -1;
+      }
+    } elsif ($i > $#b) {
+      return 1;
+    }
+
+    if ($a[$i] < $b[$i]) {
+      return -1;
+    } elsif ($a[$i] > $b[$i]) {
+      return 1;
+    }
+
+    $i++;
+  }
+}
+
+# --------------------------------------------------------------------
+# Prepare the MIB.
+#
+sub prepare_mib
+{
+  # Pre-populate mib
+  $the_mib = { };
+  $the_mib_locks = [ ];
+
+  $the_mib->{"1"} = [ "integer", scalar @{ $conf->{"meters"} }, 0, 0 ];
+  share $the_mib->{"1"}[0];
+  share $the_mib->{"1"}[1];
+  share $the_mib->{"1"}[2];
+  share $the_mib->{"1"}[3];
+
+  $the_mib->{"1"} = [ "integer", scalar @{ $conf->{"meters"} }, 0, 0 ];
+  $the_mib_locks->[0] = 1;
+  share $the_mib_locks->[0];
+
+  for(my $i = 0; $i < scalar @{ $conf->{"meters"} }; $i++) {
+    my $meter = $conf->{"meters"}[$i];
+
+    for (my $j = 1; $j <= 10; $j++) {
+      $the_mib->{"2.".$j.".".$meter}  = [ "integer", 0, 0, $meter ];
+      # Share all values
+      share $the_mib->{"2.".$j.".".$meter}[0];
+      share $the_mib->{"2.".$j.".".$meter}[1];
+      share $the_mib->{"2.".$j.".".$meter}[2];
+      share $the_mib->{"2.".$j.".".$meter}[3];
+    }
+
+    # 2.1.x has a fixed value
+    $the_mib->{"2.1.".$meter}[1] = $meter;
+
+    $the_mib_locks->[$meter] = 1;
+    share $the_mib_locks->[$meter];
+  }
+
+  # Index the mib
+  my @index = sort { oidcmp($a, $b) } keys %{ $the_mib };
+  $the_mib_index = \@index;
+
+  # Add index to the mib.
+  for (my $i = 0; $i < @index; $i++) {
+    $the_mib->{$the_mib_index->[$i]}[2] = $i;
+  }
+}
+
+# --------------------------------------------------------------------
+# Populate the MIB.
+#
+sub populate_mib
+{
+  while (1) {
+    my $start_time = time;
+
+    # Read input statistics
+    for(my $i = 0; $i < scalar @{ $conf->{"meters"} }; $i++) {
+      my $meter = $conf->{"meters"}[$i];
+      
+      my $cmd = sprintf("%s -d %s -r %d 2>/dev/null",
+			$conf->{"dsreadout"},
+			$conf->{"device"},
+			$meter);
+      my $output = `$cmd`;
+      my $success = !$?;
+
+      if (!$success) {
+	# Wait and retry once!
+	sleep 1;
+	$output = `$cmd`;
+	$success = !$?;
+      }
+      
+      if ($success) {
+	lock $the_mib_locks->[$the_mib->{"2.1.".$meter}[3]];
+
+	my $clear = 0;
+	
+	if ($output =~ /^max_voltage: (\d+)$/m) {
+	  $the_mib->{"2.2.".$meter}[1] = int($1);
+	}
+	if ($output =~ /^max_current: (\d+)$/m) {
+	  $the_mib->{"2.3.".$meter}[1] = int($1);
+	}
+	if ($output =~ /^voltage: (\d+\.\d+)$/m) {
+	  $the_mib->{"2.4.".$meter}[1] = int($1);
+	}
+	if ($output =~ /^current: (\d+\.\d+)$/m) {
+	  $the_mib->{"2.5.".$meter}[1] = int($1);
+	}
+	if ($output =~ /^real_power: (\d+\.\d+)$/m) {
+	  $the_mib->{"2.6.".$meter}[1] = int($1);
+	}
+	if ($output =~ /^reactive_power: (\d+\.\d+)$/m) {
+	  $the_mib->{"2.7.".$meter}[1] = int($1);
+	}
+	if ($output =~ /^frequency: (\d+\.\d+)$/m) {
+	  $the_mib->{"2.8.".$meter}[1] = int($1);
+	}
+	if ($output =~ /^kwhr: (\d+\.\d+)$/m) {
+	  my $n = int($1*3600000);
+	  if ($n >= 2147483647) {
+	    $clear = 1;
+	    $n = $n % 2147483647;
+	  }
+	  $the_mib->{"2.9.".$meter}[1] = $n;
+	}
+	if ($output =~ /^kvarhr: (\d+\.\d+)$/m) {
+	  my $n = int($1*3600000);
+	  if ($n >= 2147483647) {
+	    $clear = 1;
+	    $n = $n % 2147483647;
+	  }
+	  $the_mib->{"2.10.".$meter}[1] = $n;
+	}
+
+	if ($clear) {
+	  # Clear this counter.
+	  my $cmd = sprintf("%s -d %s -c %d 2>/dev/null",
+			    $conf->{"dsreadout"},
+			    $conf->{"device"},
+			    $meter);
+	  my $output = `$cmd`;
+	}
+      }
+    }
+
+    # Decide if we need to wait
+    my $stop_time = time;
+    if ($stop_time - $start_time < 60) {
+      sleep 60-($stop_time-$start_time);
+    }
+  }
+}
+
+# --------------------------------------------------------------------
+# Read the configuration file.
+#
+sub read_configuration
+{
+  my ($f) = @_;
+
+  my %conf = ( "dsreadout" => undef,
+	       "device" => undef,
+               "meters" => [ ] );
+
+  open C, "$f";
+  while (my $l = <C>) {
+    $l =~ s/#.*//;
+    $l =~ s/^\s*//;
+    $l =~ s/\s*$//;
+    
+    if ($l eq "") {
+      next;
+    }
+
+    if ($l =~ /^device:\s*(\S+)$/) {
+
+      $conf{"device"} = $1;
+
+    } elsif ($l =~ /^dsreadout:\s*(\S+)$/) {
+
+      $conf{"dsreadout"} = $1;
+
+    } elsif ($l =~ /^meter:\s*(\d+)$/) {
+
+      push @{ $conf{"meters"} }, $1;
+
+    } else {
+
+      printf STDERR "Invalid line '%s'.\n", $l;
+
+    }
+  }
+
+  return \%conf;
+}
+

@@ -1,0 +1,11 @@
+# Path to the dsreadout binary.
+dsreadout: /usr/local/datastream-transducer-readout/dsreadout
+
+# Serial device to which the RS485 converter is connected.
+device: /dev/ttyUSB0
+
+# List all addresses which should be polled.
+meter: 1
+meter: 2
+meter: 3
+meter: 4
